@@ -1,0 +1,1779 @@
+<!-- ButterflyDreaming Fractal Music Module — music_module.html — BD Protocol v0.1 -->
+<!-- STANDALONE (bd_M_Fractal repo). Derives an ABC score from an L-system
+     grammar (default: Hilbert curve) + turtle walk, filtering horizontal
+     segments to notes and vertical segments to rests. ABC is read-only in
+     this module — collaborative editing happens after handing off to
+     bd_M_ABC via the "Copy for ABC Player" button. Reuses bd_M_ABC's
+     Tone.js audio graph for preview playback. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ButterflyDreaming — Fractal Music Module</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body { width: 100%; height: 100%; overflow: hidden; }
+
+    body {
+      background: #0a0a0f;
+      color: #e8e8e0;
+      font-family: Georgia, 'Times New Roman', serif;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* 2026-08-19 — panel grid, ported from bd_M_ABC (music_player_layout_spec).
+       Same on mobile + desktop; BD sizes the iframe to the panel-width column,
+       so there is no breakpoint here. Replaces the old flex row + 1024px
+       stacked variant, and the derived-ABC pane it was built around. */
+    .module-layout {
+      flex: 1;
+      display: grid;
+      /* 2026-08-19 — bottom row rebalanced: ext (col 1, where BD's external-
+         website buttons dock) −10%, output (col 2) +10%. The copy and player
+         areas span cols 1-2 so their combined width is unchanged. */
+      grid-template-columns: 0.9fr 1.1fr 1fr;   /* left ⅔ = cols 1-2, right ⅓ = col 3 */
+      /* 2026-08-19 — minmax(0,1fr), NOT 1fr: a grid item's auto minimum size
+         is its content, so the 12-row stepper column grew past the grid and
+         was clipped (only the top few rows visible) instead of scrolling. */
+      grid-template-rows: auto minmax(80px, 1fr) auto;
+      grid-template-areas:
+        "copy   copy    arrows"
+        "player player  steppers"
+        "ext    output  steppers";
+      gap: 5px;
+      padding: 5px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      box-sizing: border-box;
+    }
+    .copy-panel     { grid-area: copy; }
+    .player-panel   { grid-area: player; }
+    #bd-ext-slot    { grid-area: ext; }
+    .output-panel   { grid-area: output; }
+    #bd-arrows-slot { grid-area: arrows; }
+    #control-panel  { grid-area: steppers; }
+
+    /* white-framed panels (spec §4) */
+    .panel {
+      border: 1px solid #fff;
+      border-radius: 4px;
+      padding: 5px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      align-content: flex-start;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .player-panel { flex-direction: column; align-items: center; justify-content: center; }
+    .play-row { display: flex; gap: 8px; }
+
+    /* ── no-host-chrome (2026-09-30) ────────────────────────────────────
+       #bd-ext-slot and #bd-arrows-slot are DOCK SLOTS: reserved area BD
+       stamps its ↓↑ arrows and Extension panel into. A host that draws
+       nothing around this iframe — a standalone — never stamps, so the
+       two sit there as empty dashed boxes taking a third of the top row
+       and a third of the bottom one.
+
+       Releasing them lets the stepper column run the full height (it is a
+       12-row scroller that wants it) and gives the output panel the width
+       ext was holding.
+
+       `controls-hidden` means "the host supplies the stepper column";
+       `no-host-chrome` means "the host draws NOTHING around this iframe".
+       Hiding the controls implies no chrome, so it sets both — which is why
+       this block sits ABOVE the controls-hidden one: same specificity, so
+       source order decides, and the viewer's single-column grid must win. */
+    body.no-host-chrome #bd-arrows-slot,
+    body.no-host-chrome #bd-ext-slot { display: none; }
+    body.no-host-chrome .module-layout {
+      grid-template-areas:
+        "copy   copy    steppers"
+        "player player  steppers"
+        "output output  steppers";
+    }
+
+    /* ── A VIEWER, not a controller (2026-09-24) ─────────────────────────
+       Set by the host via postMessage bd_ui_config { hideControls: true },
+       which BD's Ancillary Viewer and AVX already send — V_Kolam has
+       honoured it since 2026-09-15 and these two ignored it, so a music
+       viewer arrived carrying a full set of steppers.
+
+       That is the wrong division. Parameters are controlled where the
+       script is, on BD or BDX; the point of a viewer is to PLAY on
+       another device. So the stepper column goes, the copy buttons go
+       (authoring belongs with the script), and both dock slots go —
+       they are reserved for BD's own arrows and Extension panel, which
+       no viewer stamps into.
+
+       TRANSPORT STAYS. Play/Stop cannot be delegated: audio needs a user
+       gesture in the document that makes the sound, and a remote press
+       cannot supply one. The output panel stays with it, being what you
+       are there to look at. */
+    body.controls-hidden .copy-panel,
+    body.controls-hidden #control-panel,
+    body.controls-hidden #bd-arrows-slot,
+    body.controls-hidden #bd-ext-slot { display: none; }
+    body.controls-hidden .module-layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto minmax(0, 1fr);
+      grid-template-areas:
+        "player"
+        "output";
+    }
+    /* dock-slots — reserved for BD's ↓↑ arrows / Extension panel. Faint frame
+       so the reserved area is visible even before BD stamps into it. */
+    .dock-slot {
+      border: 1px dashed rgba(255,255,255,0.35);
+      border-radius: 4px;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    /* uniform buttons (spec §4): white frame, black bg, white font, one size */
+    .panel button {
+      border: 1px solid #fff;
+      background: #000;
+      color: #fff;
+      font-family: 'Courier New', Courier, monospace;
+      /* 2026-08-19 — text sized to FILL the button: 0.66 → 0.95rem, trimmed
+         side padding and a taller floor so the label isn't a stripe in the
+         middle of a black box. ABC deliberately keeps the smaller 0.66rem. */
+      font-size: 0.95rem;
+      line-height: 1.15;
+      padding: 3px 5px;
+      border-radius: 3px;
+      min-width: 54px;
+      min-height: 34px;
+      cursor: pointer;
+      text-align: center;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    /* output panel buttons ~10% wider than the standard 54px */
+    .output-panel button { min-width: 59px; }
+    .panel button:hover:not(:disabled)  { background: #1a1a1a; }
+    .panel button:disabled              { opacity: 0.4; cursor: not-allowed; }
+    .panel button.flash                 { background: #243f3b; color: #a0e0d0; }
+
+    /* Play/Stop exception: 2× size, light-green / light-red, dark label.
+       Keep these three values identical to M_Music/music_module.html. */
+    .big-btn {
+      min-width: 108px;
+      min-height: 52px;
+      font-size: 1.1rem;                     /* 2026-08-19 — stays above the 0.95rem panel buttons */
+      font-weight: bold;
+      color: #10240f !important;
+    }
+    .big-btn.play { background: #9be29b !important; }
+    .big-btn.stop { background: #e59b9b !important; }
+    .big-btn:hover:not(:disabled) { filter: brightness(1.08); }
+
+    /* status floats out of the grid (top-left); errors/loading only, empty
+       otherwise so it doesn't take layout space. Everything else relays up
+       to BD's status strip. */
+    #status {
+      position: absolute;
+      top: 2px;
+      left: 4px;
+      font-size: 0.6rem;
+      font-style: italic;
+      color: #9e9e90;
+      pointer-events: none;
+      max-width: 60%;
+    }
+    #status:empty { display: none; }
+    #status.err { color: #f2a0a0; }
+
+    /* piece name — the derived score's T: header (scale, root, iteration
+       count). Sits under Play/Stop; parity with the ABC player's label. */
+    #piece-title {
+      font-family: 'Georgia', 'Times New Roman', serif;
+      font-style: italic;
+      font-size: 0.8rem;
+      color: #e8e8e0;
+      text-align: center;
+      max-width: 100%;
+      overflow: hidden;
+      word-wrap: break-word;
+      line-height: 1.2;
+    }
+
+    /* stepper column: right-⅓ grid cell, white-framed, scrollable. */
+    .control-panel {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 3px;
+      /* 12 steppers never fit — the column scrolls. `flex: 0 0 auto` on the
+         rows stops them squashing to fit instead of overflowing, and a thin
+         always-visible scrollbar makes the scroll discoverable. */
+      scrollbar-width: thin;
+      overscroll-behavior: contain;
+      border: 1px solid #fff;
+      padding: 5px;
+      border-radius: 4px;
+      overflow-y: auto;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    .control-row {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      width: 100%;
+      flex: 0 0 auto;
+    }
+
+    .control-row label {
+      font-size: 0.64rem;
+      letter-spacing: 0.02em;
+      color: #4a9b8e;
+      text-align: center;
+      font-family: 'Courier New', Courier, monospace;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+
+    .stepper {
+      display: flex;
+      align-items: stretch;
+      justify-content: space-between;
+      gap: 3px;
+    }
+
+    .step-btn {
+      background: #0f0f18;
+      border: 1px solid #4a9b8e;
+      color: #4a9b8e;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 1.3rem;                       /* 2026-08-19 — +50%, matching ABC */
+      padding: 0;
+      width: 39px;                             /* 2026-08-19 — +50% (was 26) for easier taps */
+      height: 33px;                            /* 2026-08-19 — +50% (was 22) */
+      line-height: 1;
+      cursor: pointer;
+      border-radius: 3px;
+      flex: 0 0 auto;
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .step-btn:hover:not(:disabled)  { background: #1a2a28; }
+    .step-btn:active:not(:disabled) { background: #243f3b; }
+    .step-btn:disabled              { opacity: 0.4; cursor: not-allowed; }
+
+    .stepper-value {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 0.76rem;
+      color: #e8e8e0;
+      background: #0f0f18;
+      border: 1px solid #2a2a3a;
+      padding: 2px;
+      border-radius: 3px;
+      min-width: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 2026-08-19 — panel grid ported from bd_M_ABC (music_player_layout_spec).
+       Left ⅔: copy (top) / player (centre) / [ext-slot | output] (bottom).
+       Right ⅓: BD arrows-slot (top) over the scrollable stepper column.
+       #bd-arrows-slot and #bd-ext-slot are empty dock-slots BD stamps its ↓↑
+       arrows / Extension panel onto — BD needs no per-module code for either.
+       The read-only derived-ABC pane is gone; "Copy for ABC Player" still
+       hands out the same score. -->
+  <div class="module-layout">
+
+    <!-- top-left: Copy panel -->
+    <div class="panel copy-panel">
+      <button id="copy-script-btn" type="button" title="Copy the current script (grammar + all stepper values) to the clipboard">Copy Script</button>
+      <button id="copy-abc-btn" type="button" title="Copy a fully-formed bd_M_ABC script (with the derived ABC score wrapped in %%bd_score) — paste into any bd_M_ABC node to play collaboratively">Copy abc</button>
+    </div>
+
+    <!-- centre: player main controls -->
+    <div class="panel player-panel">
+      <div class="play-row">
+        <button id="play-pause-btn" class="big-btn play" type="button" disabled>Play</button>
+        <button id="stop-btn"       class="big-btn stop" type="button" disabled>Stop</button>
+      </div>
+      <div id="piece-title" title="Derived score (T: header — scale, root, iterations)"></div>
+    </div>
+
+    <!-- bottom-left: BD Extension panel docks here -->
+    <div id="bd-ext-slot" class="dock-slot"></div>
+
+    <!-- bottom (right of the ⅔): Output panel -->
+    <div class="panel output-panel">
+      <button id="bake-mp3-btn" type="button" title="Render offline to WAV and add to the bottom-bar media player" disabled>Bake</button>
+      <button id="download-mp3-btn" type="button" title="Save the most recent bake as a .wav file" disabled>Save wav</button>
+      <button id="save-midi-btn" type="button" title="Save the derived ABC score as a .mid file (MIDI, editable in any DAW)" disabled>Save midi</button>
+      <button class="ph" type="button" disabled title="(spare)">&nbsp;</button>
+    </div>
+
+    <!-- right ⅓ top: BD ↓↑ arrows dock here -->
+    <div id="bd-arrows-slot" class="dock-slot"></div>
+
+    <!-- right ⅓: scrollable stepper column -->
+    <aside id="control-panel" class="control-panel"><!-- injected --></aside>
+
+  </div>
+
+  <!-- errors / loading only; floats out of the grid (top-left) -->
+  <div id="status">Loading samples…</div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/abcjs/6.2.2/abcjs-basic-min.js"></script>
+
+  <script>
+    'use strict';
+
+    window.addEventListener('error', (ev) => {
+      const msg = (ev.error && ev.error.message) || ev.message || 'unknown error';
+      const el = document.getElementById('status');
+      if (el) { el.textContent = 'JS error: ' + msg; el.classList.add('err'); }
+      console.error('[bd_M_Fractal] window.onerror', ev.error || ev);
+    });
+
+    // ── Refs ─────────────────────────────────────────────────────────────────
+    const statusEl        = document.getElementById('status');
+    const pieceTitleEl    = document.getElementById('piece-title');
+    const playPauseBtn    = document.getElementById('play-pause-btn');
+    const stopBtn         = document.getElementById('stop-btn');
+    const copyScriptBtn   = document.getElementById('copy-script-btn');
+    const copyAbcBtn      = document.getElementById('copy-abc-btn');
+    const bakeMp3Btn      = document.getElementById('bake-mp3-btn');
+    const downloadBtn     = document.getElementById('download-mp3-btn');
+    const saveMidiBtn     = document.getElementById('save-midi-btn');
+    const controlPanel    = document.getElementById('control-panel');
+
+    // ── State ───────────────────────────────────────────────────────────────
+    let samplerReady    = false;
+    let abcReady        = false;
+    let playerState     = 'stopped';
+    let notePart        = null;
+    let noteEvents      = [];
+    let endTimeSecs     = 0;
+    let storedText      = '';        // the incoming L-system script
+    let derivedAbc      = '';        // the currently-derived ABC string
+    let baking          = false;
+    let lastBakedBlob   = null;
+    let lastBakedLabel  = '';
+
+    // ── Scale tables (semitone offsets from root) ───────────────────────────
+    // Pentatonic here is MINOR pentatonic (C Eb F G Bb) — fewer dissonant
+    // intervals than the major pentatonic (which used to occupy this slot).
+    // User 2026-08-08: 'the minor has fewer dissonat intervals so use that
+    // instead'. Old 'pentatonic' name kept as an alias so scripts saved
+    // before this change still parse.
+    const SCALES = {
+      minor:         [0, 2, 3, 5, 7, 8, 10],   // natural minor / Aeolian
+      major:         [0, 2, 4, 5, 7, 9, 11],
+      min_pentatonic:[0, 3, 5, 7, 10],
+      blues:         [0, 3, 5, 6, 7, 10]
+    };
+    // Aliases preserve backward compatibility with scripts that use the
+    // pre-2026-08-08 name 'minor_pentatonic' (and the older shorthand
+    // 'pentatonic'). New canonical name is 'min_pentatonic' — narrower
+    // stepper cell + fits comfortably in 2-column mobile layout.
+    const SCALE_ALIASES = { pentatonic: 'min_pentatonic', minor_pentatonic: 'min_pentatonic' };
+    const SCALE_NAMES = Object.keys(SCALES);
+
+    // Display-only aliases for enum stepper values: the canonical name is what
+    // goes in the script, a shorter label is what fits the narrow stepper cell.
+    // getStepperValue reads the cell back, so it inverts this map.
+    const ENUM_DISPLAY = { min_pentatonic: 'pent' };
+    const ENUM_DISPLAY_INV = Object.fromEntries(
+      Object.entries(ENUM_DISPLAY).map(([canon, shown]) => [shown, canon]));
+
+    const NOTE_NAMES  = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    // ABC key-signature strings for each scale (used in the K: header).
+    // Minor pentatonic uses K:min so its chromatic notes (Eb, Bb) land
+    // implicitly via the key signature — cleaner-reading ABC than K:maj
+    // + explicit accidentals would be.
+    const SCALE_TO_ABC_KEY_SUFFIX = {
+      minor:         'min',
+      major:         'maj',
+      min_pentatonic:'min',
+      blues:         'maj'
+    };
+
+    // ── Steppers ────────────────────────────────────────────────────────────
+    // Iterations upper bound: 20. Depth-first streaming expansion below
+    // means memory cost is O(iterations) rather than O(4^iterations), so
+    // iter 20 is as cheap as iter 3 for the same truncation length.
+    // Steppers split into two behaviour classes:
+    //   regen:true   → any change triggers ABC re-derivation (structural
+    //                  params — iterations, tempo, scale, root).
+    //   regen:false  → change routes straight to the live audio node via
+    //                  applyParam (effect knobs — tweak while playing).
+    // logStep:true   → +/− multiplies by a log ratio instead of adding
+    //                  linear step (perceptual scaling for reverb decay /
+    //                  vibrato frequency).
+    const STEPPERS = [
+      { name: 'iterations',        min: 5,   max: 20,  step: 1,    fallback: 5,   regen: true },
+      { name: 'step_seconds',      min: 0.1, max: 2.0, step: 0.1,  fallback: 0.2, regen: true },
+      { name: 'vertical_time',     min: 0.0, max: 2.0, step: 0.1,  fallback: 0.2, regen: true },
+      { name: 'scale',             min: 0,   max: SCALE_NAMES.length - 1, step: 1, fallback: 2,
+        isEnum: true, values: SCALE_NAMES, regen: true },
+      // 'root' stepper retired 2026-08-08 — set via %%bd_root in the
+      // script instead (allows ABC-style octave suffix, e.g. C,, / C').
+      { name: 'reverb_wet',        min: 0,   max: 1,   step: 0.05, fallback: 0.35 },
+      { name: 'reverb_decay',      min: 0.1, max: 20,  step: 0.1,  fallback: 2.5,  logStep: true },
+      { name: 'vibrato_frequency', min: 0.5, max: 20,  step: 0.1,  fallback: 5.0,  logStep: true },
+      { name: 'vibrato_depth',     min: 0,   max: 1,   step: 0.05, fallback: 0.15 },
+      { name: 'chorus_wet',        min: 0,   max: 1,   step: 0.05, fallback: 0.2 },
+      { name: 'chorus_depth',      min: 0,   max: 1,   step: 0.05, fallback: 0.3 },
+      { name: 'loop',              min: 0,   max: 1,   step: 1,    fallback: 0,   isToggle: true },
+      { name: 'loop_gap',          min: 0,   max: 30,  step: 1,    fallback: 6 }
+    ];
+
+    // Safety caps:
+    //   MAX_TURTLE_INPUT_CHARS — how many post-skip symbols we walk.
+    //   MAX_TOTAL_EMISSION — hard ceiling on skip + post-skip. Grammar
+    //     growth is exponential per iteration; without this, iter 9+ of
+    //     Peano would ask for ~4 billion symbols and crash the JS heap
+    //     (silent failure = notes-don't-update). If the requested iter's
+    //     skip-plus-emit would exceed this, we drop the effective iter
+    //     count until it fits and surface the fact in the status readout.
+    //   MAX_NOTES — post-collapse-and-reflect run count cap.
+    const MAX_TURTLE_INPUT_CHARS  = 300000;     // musical length limit
+    const MAX_TOTAL_EMISSION      = 5000000;    // hard memory ceiling
+    const MAX_NOTES               = 1000;       // final note count cap
+
+    STEPPERS.forEach((s) => {
+      const row = document.createElement('div');
+      row.className = 'control-row';
+      row.innerHTML = `
+        <div class="stepper">
+          <button class="step-btn" type="button" data-name="${s.name}" data-delta="-1">−</button>
+          <span class="stepper-value" data-name="${s.name}">${formatDisplay(s, s.fallback)}</span>
+          <button class="step-btn" type="button" data-name="${s.name}" data-delta="1">+</button>
+        </div>
+        <label>${s.name}</label>
+      `;
+      controlPanel.appendChild(row);
+    });
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    const postToParent = (msg) => window.parent.postMessage(msg, '*');
+
+    // ── Forward this module's console to the host (2026-09-23) ─────────────
+    //
+    // V_Kolam has done this since 2026-09-17 and it has settled several faults
+    // in a line. Fractal had it not, which is why BD's log has been all Kolam:
+    // a fault in here was invisible unless someone had the iframe's own
+    // console open, and nobody has that on a phone.
+    //
+    // Best-effort and non-fatal by construction — a logger that can break the
+    // thing it is logging is worse than no logger.
+    (function forwardModuleConsole() {
+      const send = (level, args) => {
+        try {
+          const line = Array.prototype.map.call(args, (a) => {
+            if (typeof a === 'string') return a;
+            // An Error JSON.stringifies to "{}" — message and stack are
+            // non-enumerable. Kolam's first attempt logged 506 lines of
+            // "render error: {}", the one fact needed missing from all of them.
+            if (a instanceof Error) return a.message + (a.stack ? ' | ' + a.stack.split('\n')[1] : '');
+            try { return JSON.stringify(a); } catch (_) { return String(a); }
+          }).join(' ');
+          postToParent({ type: 'bd_module_log', level: level, line: line.slice(0, 600) });
+        } catch (_) {}
+      };
+      ['log', 'warn', 'error'].forEach((level) => {
+        const original = console[level].bind(console);
+        console[level] = function () { send(level, arguments); original.apply(console, arguments); };
+      });
+    })();
+    const setStatus = (msg, isErr = false) => {
+      // 2026-08-19 — parity with bd_M_ABC: the in-module corner text sits
+      // behind the copy panel and is unreadable, so status relays UP to BD's
+      // status strip and the local #status is kept empty (:empty → hidden).
+      // Only REAL errors are forwarded; playback chatter sends empty text so
+      // the strip falls back to the connection count.
+      statusEl.textContent = '';
+      postToParent({ type: 'BD_STATUS', text: isErr ? (msg || '') : '', isErr: !!isErr });
+    };
+
+    function formatDisplay(spec, val) {
+      // 2026-09-24 — 'true'/'false', not 'on'/'off'. The readout must say what
+      // the DIRECTIVE says: the script carries `%%bd_loop false`, and a
+      // control reading "off" beside it invites the reader to wonder whether
+      // they are the same thing. Kolam's colour_speed was corrected the same
+      // way — show the directive's own value rather than a second vocabulary
+      // for it.
+      if (spec.isToggle) return val >= 0.5 ? 'true' : 'false';
+      if (spec.isEnum) {
+        const v = spec.values[Math.round(val)] || spec.values[0];
+        return ENUM_DISPLAY[v] || v;
+      }
+      if (spec.step >= 1) return String(Math.round(val));
+      if (val < 1)  return val.toFixed(2);
+      if (val < 10) return val.toFixed(1);
+      return String(Math.round(val));
+    }
+    function getStepperValue(name) {
+      const s = STEPPERS.find(x => x.name === name);
+      if (!s) return null;
+      const span = controlPanel.querySelector(`.stepper-value[data-name="${name}"]`);
+      if (!span) return s.fallback;
+      const txt = span.textContent.trim();
+      // The INVERSE of formatDisplay, and it has to move with it. This read
+      // `txt === 'on'`, so the moment the readout began saying 'true' every
+      // read of loop returned 0 — the value would have flipped itself off on
+      // the next stepper press, silently. A renderer needs its inverse beside
+      // it; 'on' is accepted too, so a panel rendered before this change is
+      // still read correctly.
+      if (s.isToggle) return (txt === 'true' || txt === 'on') ? 1 : 0;
+      if (s.isEnum) return s.values.indexOf(ENUM_DISPLAY_INV[txt] || txt);
+      const v = parseFloat(txt);
+      return Number.isFinite(v) ? v : s.fallback;
+    }
+    function setStepperValue(name, val) {
+      const s = STEPPERS.find(x => x.name === name);
+      if (!s) return;
+      let clamped = Math.max(s.min, Math.min(s.max, val));
+      if (s.isToggle) clamped = clamped >= 0.5 ? 1 : 0;
+      const span = controlPanel.querySelector(`.stepper-value[data-name="${name}"]`);
+      if (span) span.textContent = formatDisplay(s, clamped);
+    }
+
+    // ── L-system + turtle + ABC generation ──────────────────────────────────
+
+    function parseGrammarFromScript(text) {
+      // Fallbacks match preview.html's DEFAULT_SCRIPT (Peano curve on
+      // C pentatonic, fast 0.2 s stepping). Effect params default to
+      // the same values as bd_M_ABC so the two modules feel similar.
+      const g = {
+        axiom:      'X',
+        rules:      {
+          X: 'XFYFX+F+YFXFY-F-XFYFX',
+          Y: 'YFXFY-F-XFYFX+F+YFXFY'
+        },
+        iterations: 5,
+        angle:      90,
+        scale:      'min_pentatonic',
+        root:       0,
+        rootOctave: -1,  // matches DEFAULT_SCRIPT %%bd_root C, (tonic = C3)
+        stepSeconds:  0.2,
+        verticalTime: 0.2,
+        reverbWet:        0.35,
+        reverbDecay:      2.5,
+        vibratoFrequency: 5.0,
+        vibratoDepth:     0.15,
+        chorusWet:        0.2,
+        chorusDepth:      0.3,
+        loop:             false,
+        loopGap:          6,
+        // Chord mode: each melody note becomes a 3-note chord using the
+        // notes further on in the sequence at offset2 and offset3
+        // positions. Piece ends offset3 notes earlier than melody form
+        // so every chord is a complete triad. Larger offsets = more
+        // decoupled voices = higher overall pitch range.
+        offset2:          30,
+        offset3:          60
+      };
+      const axiomM = text.match(/^%%bd_(?:p_)?axiom\s+(\S+)/m);
+      if (axiomM) g.axiom = axiomM[1];
+      // rules: multiple '%%bd_rule <sym>: <expansion>' lines
+      const ruleRe = /^%%bd_(?:p_)?rule\s+(\S)\s*:\s*(.+?)\s*$/gm;
+      const foundRules = {};
+      let m;
+      while ((m = ruleRe.exec(text)) !== null) {
+        foundRules[m[1]] = m[2];
+      }
+      if (Object.keys(foundRules).length) g.rules = foundRules;
+      const iterM = text.match(/^%%bd_(?:p_)?iterations\s+(\d+)/m);
+      if (iterM) g.iterations = Math.max(5, Math.min(20, parseInt(iterM[1], 10)));
+      const angleM = text.match(/^%%bd_(?:p_)?angle\s+([\d.]+)/m);
+      if (angleM) g.angle = parseFloat(angleM[1]);
+      const scaleM = text.match(/^%%bd_(?:p_)?scale\s+(\w+)/m);
+      if (scaleM) {
+        const raw = scaleM[1];
+        const resolved = SCALES[raw] ? raw : SCALE_ALIASES[raw];
+        if (resolved) g.scale = resolved;
+      }
+      // ABC-style root: letter + optional accidental + optional octave
+      // suffix (',' × N = down N octaves, "'" × N = up N octaves).
+      // Clamped so the effective tonic MIDI + reflection's ±octave range
+      // fits within full piano (MIDI [21, 108] = A0..C8). Tonic itself
+      // must be in [33, 96] so the top/bottom of the walk lands on the
+      // outermost piano keys and no further. Loosened v-2026-08-08 from
+      // the earlier extra-safe clamp that was cutting C,, back to C,.
+      const rootM = text.match(/^%%bd_(?:p_)?root\s+([A-G][#b]?|\d+)((?:,+|'+)?)/m);
+      if (rootM) {
+        const r = rootM[1];
+        if (/^\d+$/.test(r)) g.root = Math.max(0, Math.min(11, parseInt(r, 10)));
+        else {
+          const idx = NOTE_NAMES.indexOf(r.replace('b', '').replace('B', 'b'));
+          if (idx >= 0) g.root = idx;
+        }
+        const suffix = rootM[2] || '';
+        let octShift = 0;
+        if (suffix.length > 0) octShift = suffix[0] === ',' ? -suffix.length : suffix.length;
+        // Tonic MIDI in [33, 96] → notes in [21, 108] = full piano.
+        const baseMidi = 60 + g.root;
+        const octMin = Math.ceil((33 - baseMidi) / 12);
+        const octMax = Math.floor((96 - baseMidi) / 12);
+        g.rootOctave = Math.max(octMin, Math.min(octMax, octShift));
+      }
+      const ssM = text.match(/^%%bd_(?:p_)?step_seconds\s+([\d.]+)/m);
+      if (ssM) g.stepSeconds = Math.max(0.05, parseFloat(ssM[1]));
+      const vtM = text.match(/^%%bd_(?:p_)?vertical_time\s+([\d.]+)/m);
+      if (vtM) g.verticalTime = Math.max(0, parseFloat(vtM[1]));
+      // Effect directives (same names + shape as bd_M_ABC for cross-module
+      // paste compatibility).
+      const rwM = text.match(/^%%bd_(?:p_)?reverb_wet\s+([\d.]+)/m);
+      if (rwM) g.reverbWet = parseFloat(rwM[1]);
+      const rdM = text.match(/^%%bd_(?:p_)?reverb_decay\s+([\d.]+)/m);
+      if (rdM) g.reverbDecay = parseFloat(rdM[1]);
+      const vfM = text.match(/^%%bd_(?:p_)?vibrato_frequency\s+([\d.]+)/m);
+      if (vfM) g.vibratoFrequency = parseFloat(vfM[1]);
+      const vdM = text.match(/^%%bd_(?:p_)?vibrato_depth\s+([\d.]+)/m);
+      if (vdM) g.vibratoDepth = parseFloat(vdM[1]);
+      const cwM = text.match(/^%%bd_(?:p_)?chorus_wet\s+([\d.]+)/m);
+      if (cwM) g.chorusWet = parseFloat(cwM[1]);
+      const cdM = text.match(/^%%bd_(?:p_)?chorus_depth\s+([\d.]+)/m);
+      if (cdM) g.chorusDepth = parseFloat(cdM[1]);
+      const lpM = text.match(/^%%bd_(?:p_)?loop\s+(true|false|on|off|1|0)/mi);
+      if (lpM) g.loop = /^(true|on|1)$/i.test(lpM[1]);
+      const lgM = text.match(/^%%bd_(?:p_)?loop_gap\s+([\d.]+)/m);
+      if (lgM) g.loopGap = parseFloat(lgM[1]);
+      const o2M = text.match(/^%%bd_(?:p_)?offset2\s+(-?\d+)/m);
+      if (o2M) g.offset2 = Math.max(0, parseInt(o2M[1], 10));
+      const o3M = text.match(/^%%bd_(?:p_)?offset3\s+(-?\d+)/m);
+      if (o3M) g.offset3 = Math.max(0, parseInt(o3M[1], 10));
+      return g;
+    }
+
+    // Compute the total symbol length of expanding `axiom` under `rules`
+    // for `iterations` iterations, WITHOUT actually materialising the
+    // string. Uses recursion + memoisation on (symbol, remaining-depth)
+    // pairs. Needed for the skip mechanism — knowing how big iter (N−1)
+    // is tells us how many leading symbols to skip in iter N.
+    function computeExpansionLength(axiom, rules, iterations) {
+      const cache = new Map();
+      function len(sym, depth) {
+        if (depth === 0 || rules[sym] === undefined) return 1;
+        const key = sym + '@' + depth;
+        if (cache.has(key)) return cache.get(key);
+        let total = 0;
+        const rule = rules[sym];
+        for (let i = 0; i < rule.length; i++) {
+          total += len(rule[i], depth - 1);
+        }
+        cache.set(key, total);
+        return total;
+      }
+      let total = 0;
+      for (const ch of axiom) total += len(ch, iterations);
+      return total;
+    }
+
+    // Expand L-system via depth-first streaming, up to `maxChars` symbols.
+    // Because rewriting is context-free (each symbol's expansion depends
+    // only on itself), we can emit iter-N's symbols one at a time via DFS
+    // recursion without ever materialising an intermediate iteration.
+    // Memory cost is O(iterations) for the stack instead of O(k^iter).
+    //
+    // Coded as an explicit-stack loop rather than a JS generator function
+    // to avoid per-yield GC pressure at ~million-symbol outputs.
+    function expandLSystem(axiom, rules, iterations, maxChars) {
+      const cap = maxChars;
+      const parts = [];
+      let truncated = false;
+      // Explicit-stack DFS. Each frame is {expansion, index, depth}:
+      // 'expansion' is the string being iterated (axiom at the outer
+      // level, a rule's RHS deeper in); 'index' is the next symbol to
+      // process; 'depth' is remaining iterations to apply at this level.
+      const stack = [{ expansion: axiom, index: 0, depth: iterations }];
+      while (stack.length > 0) {
+        if (parts.length >= cap) { truncated = true; break; }
+        const frame = stack[stack.length - 1];
+        if (frame.index >= frame.expansion.length) {
+          stack.pop();
+          continue;
+        }
+        const sym = frame.expansion[frame.index];
+        frame.index++;
+        const rule = rules[sym];
+        if (frame.depth === 0 || rule === undefined) {
+          // Leaf: emit the symbol as-is
+          parts.push(sym);
+        } else {
+          // Recurse: push a new frame at depth-1 over this rule's RHS
+          stack.push({ expansion: rule, index: 0, depth: frame.depth - 1 });
+        }
+      }
+      return { symbols: parts.join(''), turtleTruncated: truncated };
+    }
+
+    // Turtle: walk the symbol string with F=forward, +=turn CCW, -=turn CW.
+    // Heading in degrees, 0 = east. Each F emits a segment tagged with
+    // the source symbol index (needed for the skip mechanism — we walk
+    // the whole prefix to maintain turtle state but only KEEP segments
+    // from symIdx ≥ skipSymbols downstream).
+    function turtleWalk(symbols, angleDeg) {
+      const segments = [];
+      let x = 0, y = 0, heading = 0;
+      for (let i = 0; i < symbols.length; i++) {
+        const ch = symbols[i];
+        if (ch === 'F') {
+          const rad = heading * Math.PI / 180;
+          const dx = Math.cos(rad), dy = Math.sin(rad);
+          const nx = x + dx, ny = y + dy;
+          const isHorizontal = Math.abs(dx) > 0.5;
+          segments.push({ symIdx: i, x1: x, y1: y, x2: nx, y2: ny, isHorizontal, length: 1 });
+          x = nx; y = ny;
+        } else if (ch === '+') {
+          heading = (heading + angleDeg) % 360;
+        } else if (ch === '-') {
+          heading = (heading - angleDeg + 360) % 360;
+        }
+      }
+      return segments;
+    }
+
+    // Map an integer y-coordinate to a MIDI note number given a scale + root.
+    // y=0 → root note in a low octave; each increment steps one degree up the
+    // scale, wrapping to the next octave when past the end.
+    function pitchForY(y, scaleName, rootIdx, baseOctave) {
+      const degrees = SCALES[scaleName] || SCALES.minor;
+      const yInt    = Math.round(y);
+      // Handle negative y with a floor'd modulo.
+      const octaveOff = Math.floor(yInt / degrees.length);
+      const degree    = ((yInt % degrees.length) + degrees.length) % degrees.length;
+      const rootMidi  = 60 + rootIdx + (baseOctave - 4) * 12;  // C4 = 60
+      return rootMidi + octaveOff * 12 + degrees[degree];
+    }
+
+    // MIDI note number → ABC token. Base octave 4 in ABC uses lowercase
+    // (c, d, e, …); octave 3 uses uppercase (C, D, E, …); octave 5 adds ',
+    // octave 2 adds ',' (comma).
+    // Accidentals: ^ for sharp, _ for flat.
+    const ABC_NAT   = ['C','C','D','D','E','F','F','G','G','A','A','B'];
+    const ABC_ACCID = ['', '^','', '^','', '','^','', '^','', '^',''];
+    function midiToAbc(midi) {
+      const noteIdx = ((midi % 12) + 12) % 12;
+      const oct     = Math.floor(midi / 12) - 1;   // MIDI 60 = C4, so oct 4 for note 60
+      let name      = ABC_NAT[noteIdx];
+      const accid   = ABC_ACCID[noteIdx];
+      if (oct >= 5) {
+        name = name.toLowerCase();
+        for (let i = 5; i < oct; i++) name += "'";
+      } else if (oct === 4) {
+        name = name.toLowerCase();
+      } else {
+        // oct <= 3
+        for (let i = 3; i > oct; i--) name += ",";
+      }
+      return accid + name;
+    }
+
+    // Collapse consecutive segments in the same class-and-position into
+    // "runs" — Prusinkiewicz's interpretation (ABoP ch. 6). Consecutive
+    // horizontal Fs at the same y merge into one sustained note whose
+    // duration = run length. Consecutive vertical Fs merge into one longer
+    // rest. Result: notes of varying length (1, 2, 3+ beats) rather than
+    // uniform quarters, which is what makes the derived melody musically
+    // interesting.
+    function collapseRuns(segments) {
+      const out = [];
+      let i = 0;
+      while (i < segments.length) {
+        const seg = segments[i];
+        let runLen = 1;
+        let j = i + 1;
+        if (seg.isHorizontal) {
+          const y = Math.round(seg.y1);
+          while (j < segments.length && segments[j].isHorizontal
+                 && Math.round(segments[j].y1) === y) {
+            runLen++;
+            j++;
+          }
+        } else {
+          while (j < segments.length && !segments[j].isHorizontal) {
+            runLen++;
+            j++;
+          }
+        }
+        out.push({ ...seg, length: runLen });
+        i = j;
+      }
+      return out;
+    }
+
+    // Pitch-reflection: walk the raw y-deltas as a "particle" bouncing
+    // between two walls at +scaleLength (one octave above tonic) and
+    // -scaleLength (one octave below tonic). Total span = two octaves,
+    // symmetrically around the starting note. Original asymmetric rule
+    // (2026-08-07) only reflected at the upper bound → user saw notes
+    // 4 octaves down. User's revised spec (2026-08-07 v2): reflect at
+    // the lower boundary too, at one octave below start rather than at
+    // start itself, so the effective range is [−octave, +octave].
+    //
+    // Implementation: one-step-at-a-time bouncing simulation. For each
+    // raw-delta of magnitude N, take N unit steps in the current
+    // direction. If a step would cross either wall, flip direction and
+    // retry — the step is bounced back into range without being
+    // consumed. Effective y always stays in [−scaleLength, +scaleLength].
+    function applyPitchReflection(runs, scaleLength) {
+      const upper =  scaleLength;
+      const lower = -scaleLength;
+      const out = [];
+      let prevRawY = null;
+      let effectiveY = 0;
+      let direction = 1;               // +1 = normal, -1 = inverted
+      for (const run of runs) {
+        if (run.isHorizontal) {
+          const rawY = Math.round(run.y1);
+          if (prevRawY !== null) {
+            const rawDelta = rawY - prevRawY;
+            if (rawDelta !== 0) {
+              let step = (rawDelta > 0 ? 1 : -1) * direction;
+              let remaining = Math.abs(rawDelta);
+              while (remaining > 0) {
+                const next = effectiveY + step;
+                if (next > upper || next < lower) {
+                  step = -step;
+                  direction = -direction;
+                } else {
+                  effectiveY = next;
+                  remaining--;
+                }
+              }
+            }
+          } else {
+            // First horizontal (v-fix 2026-08-07): seed effectiveY from the
+            // RAW starting y (wrapped into [0, scaleLength)) rather than
+            // always 0. Different iterations start at genuinely different
+            // absolute y (iter 2 slice at y=2, iter 3 at y=8, iter 4 at
+            // y=26, …) so this seeding gives each iteration a distinct
+            // opening note — otherwise Peano's self-similar structure
+            // means the delta sequence is identical and all iterations
+            // sound the same at the start.
+            effectiveY = ((rawY % scaleLength) + scaleLength) % scaleLength;
+          }
+          prevRawY = rawY;
+          out.push({ ...run, y1: effectiveY, y2: effectiveY });
+        } else {
+          out.push(run);
+        }
+      }
+      return out;
+    }
+
+    // Generate ABC string from a params object + segments. Runs are collapsed
+    // first so each horizontal run → one note with duration = run length,
+    // each vertical run → one rest (scaled by verticalTime). Then the
+    // pitch-reflection rule keeps effective y in a bounded 2-octave range.
+    // Scan forward to the first horizontal run at tonic (scale degree 0) so
+    // every iteration opens on the root note — user 2026-08-07: "start the
+    // sequence at the first C - its a bit wierd to start at d in a scale of C".
+    // Finally, cap total runs at MAX_NOTES to keep any single piece from
+    // dragging on forever (~5 min max at 0.5s/step with the current cap).
+    let generateAbcTruncated = false;
+    function generateAbc(segments, g) {
+      generateAbcTruncated = false;
+      const scaleLen = (SCALES[g.scale] || SCALES.major).length;
+      const rawRuns  = collapseRuns(segments);
+      let runs       = applyPitchReflection(rawRuns, scaleLen);
+      // Scan forward to the first horizontal at tonic (y ≡ 0 mod scaleLen).
+      const firstTonic = runs.findIndex(r => {
+        if (!r.isHorizontal) return false;
+        const mod = ((Math.round(r.y1) % scaleLen) + scaleLen) % scaleLen;
+        return mod === 0;
+      });
+      if (firstTonic > 0) runs = runs.slice(firstTonic);
+      if (runs.length > MAX_NOTES) {
+        console.warn(`[bd_M_Fractal] truncating ${runs.length} runs → ${MAX_NOTES}`);
+        runs = runs.slice(0, MAX_NOTES);
+        generateAbcTruncated = true;
+      }
+      const bpm = Math.max(20, Math.round(60 / g.stepSeconds));
+      const rootName = NOTE_NAMES[g.root];
+      const keySig = rootName + (SCALE_TO_ABC_KEY_SUFFIX[g.scale] || 'min');
+      const lines = [
+        'X:1',
+        `T:Fractal (${g.scale} on ${rootName}, iter ${g.iterations})`,
+        'M:4/4',
+        'L:1/4',
+        `Q:1/4=${bpm}`,
+        `K:${keySig}`,
+      ];
+      // ABC length token for an integer or simple fractional beat count.
+      function lenToken(len) {
+        if (Math.abs(len - 1) < 0.01) return '';
+        if (Math.abs(len - 2) < 0.01) return '2';
+        if (Math.abs(len - 3) < 0.01) return '3';
+        if (Math.abs(len - 4) < 0.01) return '4';
+        if (Math.abs(len - 0.5) < 0.01) return '/2';
+        if (Number.isInteger(len)) return String(len);
+        return len.toFixed(2);   // fractional — abcjs accepts
+      }
+      // Chord mode (user 2026-08-08): each horizontal run becomes a 3-note
+      // chord using the notes further on in the SEQUENCE OF NOTES at
+      // offset2 and offset3 positions. Rests interleave as before —
+      // offset counting operates on notes only, not on all runs. Piece
+      // ends at the last note index k where k + offset3 still exists,
+      // so every chord is a complete triad (piece is offset3 notes
+      // shorter than plain melody form). Disabled if both offsets are 0.
+      const chordMode = g.offset2 > 0 || g.offset3 > 0;
+      // Build note-list: horizontal runs only, with their pitches computed.
+      const notes = [];       // { runIdx, midi, length }
+      for (let i = 0; i < runs.length; i++) {
+        const r = runs[i];
+        if (r.isHorizontal) {
+          notes.push({
+            runIdx: i,
+            midi: pitchForY(r.y1, g.scale, g.root, 4 + g.rootOctave),
+            length: r.length
+          });
+        }
+      }
+      // Last valid note index for chord mode (need k+offset3 to exist).
+      const maxOff = Math.max(g.offset2, g.offset3);
+      const lastNoteIdx = chordMode ? (notes.length - 1 - maxOff) : (notes.length - 1);
+      const lastRunIdx  = lastNoteIdx >= 0 ? notes[lastNoteIdx].runIdx : -1;
+
+      let body = '';
+      let barAccum = 0;
+      const barLength = 4;
+      let barCount = 0;
+      let noteK = 0;    // position within note-list for the current horizontal run
+      for (let i = 0; i < runs.length; i++) {
+        if (lastRunIdx >= 0 && i > lastRunIdx) break;
+        const run = runs[i];
+        let beats;
+        if (run.isHorizontal) {
+          if (chordMode) {
+            const p1raw = notes[noteK].midi;
+            const p2raw = notes[Math.min(noteK + g.offset2, notes.length - 1)].midi;
+            const p3raw = notes[Math.min(noteK + g.offset3, notes.length - 1)].midi;
+            // Octave-spread voicing (user 2026-08-08): p2 shifted down one
+            // octave, p3 shifted up one octave, p1 unchanged. Widens the
+            // chord span from ~octave to ~3 octaves for richer harmony.
+            // Fold back into piano range [21, 108] if the shift would push
+            // off the keyboard.
+            let p2 = p2raw - 12; if (p2 < 21)  p2 = p2raw;
+            let p3 = p3raw + 12; if (p3 > 108) p3 = p3raw;
+            body += '[' + midiToAbc(p1raw) + midiToAbc(p2) + midiToAbc(p3) + ']' + lenToken(run.length);
+          } else {
+            body += midiToAbc(notes[noteK].midi) + lenToken(run.length);
+          }
+          beats = run.length;
+          noteK++;
+        } else {
+          if (g.verticalTime <= 0) continue;
+          const restBeats = g.verticalTime * run.length;
+          body += 'z' + lenToken(restBeats);
+          beats = restBeats;
+        }
+        barAccum += beats;
+        if (barAccum >= barLength - 0.001) {
+          body += '|';
+          barCount++;
+          barAccum = 0;
+          if (barCount % 4 === 0) body += '\n';
+          else body += ' ';
+        } else {
+          body += ' ';
+        }
+      }
+      return lines.join('\n') + '\n' + body.trim() + '\n';
+    }
+
+    // Sync steppers FROM the incoming script. Called only when a fresh
+    // script arrives (BD_INIT / bd_script_update / initial load) so a user's
+    // stepper tweaks aren't wiped between edits. Effect steppers also route
+    // their new values into the live audio graph via applyParam.
+    function syncSteppersFromScript() {
+      const g = parseGrammarFromScript(storedText || '');
+      setStepperValue('iterations',        g.iterations);
+      setStepperValue('step_seconds',      g.stepSeconds);
+      setStepperValue('vertical_time',     g.verticalTime);
+      setStepperValue('scale',             SCALE_NAMES.indexOf(g.scale));
+      // 'root' stepper retired — driven from %%bd_root script directive only.
+      setStepperValue('reverb_wet',        g.reverbWet);
+      setStepperValue('reverb_decay',      g.reverbDecay);
+      setStepperValue('vibrato_frequency', g.vibratoFrequency);
+      setStepperValue('vibrato_depth',     g.vibratoDepth);
+      setStepperValue('chorus_wet',        g.chorusWet);
+      setStepperValue('chorus_depth',      g.chorusDepth);
+      setStepperValue('loop',              g.loop ? 1 : 0);
+      setStepperValue('loop_gap',          g.loopGap);
+      applyParam('reverb_wet',        g.reverbWet);
+      applyParam('reverb_decay',      g.reverbDecay);
+      applyParam('vibrato_frequency', g.vibratoFrequency);
+      applyParam('vibrato_depth',     g.vibratoDepth);
+      applyParam('chorus_wet',        g.chorusWet);
+      applyParam('chorus_depth',      g.chorusDepth);
+      applyParam('loop',              g.loop ? 1 : 0);
+      applyParam('loop_gap',          g.loopGap);
+    }
+
+    // Re-derive the ABC from CURRENT stepper values + parsed script's
+    // non-stepper params (axiom, rules, angle). Does NOT touch stepper
+    // display — that was the earlier bug where every stepper click
+    // immediately reverted itself.
+    function regenerateAbc() {
+      const g = parseGrammarFromScript(storedText || '');
+      g.iterations   = getStepperValue('iterations');
+      g.stepSeconds  = getStepperValue('step_seconds');
+      g.verticalTime = getStepperValue('vertical_time');
+      g.scale        = SCALE_NAMES[getStepperValue('scale')] || 'major';
+      // g.root and g.rootOctave stay as parsed from the script (no stepper).
+
+      // Skip mechanism (user 2026-08-07): iter N and iter (N-1) share the
+      // same first L(N-1) symbols (DFS emission property). Skip that
+      // prefix so bumping iterations reveals new material.
+      //
+      // Effective-iteration guard (2026-08-07 v2): grammar growth is
+      // exponential (9× per iter for Peano), so L(N-1) at high iter can
+      // exceed our memory ceiling. Step the effective iteration count
+      // down until skip + emit-cap fits in MAX_TOTAL_EMISSION. Surface
+      // in status if the requested iter was reduced.
+      let effIter    = g.iterations;
+      let skipSymbols = 0;
+      let iterReduced = false;
+      while (effIter > 1) {
+        const proposedSkip = computeExpansionLength(g.axiom, g.rules, effIter - 1);
+        if (proposedSkip + MAX_TURTLE_INPUT_CHARS <= MAX_TOTAL_EMISSION) {
+          skipSymbols = proposedSkip;
+          break;
+        }
+        effIter--;
+        iterReduced = true;
+      }
+      const emitCap = Math.min(skipSymbols + MAX_TURTLE_INPUT_CHARS, MAX_TOTAL_EMISSION);
+      const { symbols, turtleTruncated } =
+        expandLSystem(g.axiom, g.rules, effIter, emitCap);
+      const allSegments = turtleWalk(symbols, g.angle);
+      const firstIdx = allSegments.findIndex(s => s.symIdx >= skipSymbols);
+      const segments = firstIdx >= 0 ? allSegments.slice(firstIdx) : allSegments;
+      derivedAbc = generateAbc(segments, g);
+      lastGenerationInfo = {
+        turtleTruncated,
+        symbolsLen:  symbols.length,
+        skipSymbols,
+        skippedSegments: firstIdx >= 0 ? firstIdx : 0,
+        requestedIter:   g.iterations,
+        effectiveIter:   effIter,
+        iterReduced
+      };
+      // 2026-08-19 — the read-only ABC pane is gone (grid layout). Surface the
+      // derived score's T: header instead; "Copy for ABC Player" still hands
+      // out the full script, so nothing is lost but the wall of text.
+      const tMatch = derivedAbc.match(/^T:\s*(.+?)\s*$/m);
+      pieceTitleEl.textContent = tMatch ? tMatch[1] : '';
+      loadDerivedAbcIntoPlayer();
+    }
+    let lastGenerationInfo = {
+      turtleTruncated: false, symbolsLen: 0,
+      skipSymbols: 0, skippedSegments: 0,
+      requestedIter: 0, effectiveIter: 0, iterReduced: false
+    };
+
+    // ── Audio: reused from bd_M_ABC ─────────────────────────────────────────
+    // Loop state — driven by the loop / loop_gap steppers. loopEnabled = 1
+    // makes startPlayback re-schedule itself after endTimeSecs + loopGapSecs.
+    let loopEnabled = false;
+    let loopGapSecs = 6;
+    let reverb, vibrato, chorus, sampler;
+    try {
+      reverb  = new Tone.Reverb({ decay: 2.5 });
+      reverb.wet.value = 0.35;
+      vibrato = new Tone.Vibrato({ frequency: 5, depth: 0.15, type: 'sine' });
+      chorus  = new Tone.Chorus({ frequency: 1.5, delayTime: 3.5, depth: 0.3, wet: 0.2 });
+      chorus.start();
+      sampler = new Tone.Sampler({
+        urls: {
+          'F#2': 'bass_recorder_Fs2.mp3',
+          'C3':  'bass_recorder_C3.mp3',
+          'G#3': 'bass_recorder_Gs3.mp3',
+          'E4':  'bass_recorder_E4.mp3'
+        },
+        baseUrl: './bass-recorder/',
+        onerror: (err) => {
+          const msg = `Failed to load samples: ${err}`;
+          console.error(msg); setStatus(msg, true);
+        }
+      });
+      sampler.connect(chorus);
+      chorus.connect(vibrato);
+      vibrato.connect(reverb);
+      reverb.toDestination();
+    } catch (err) {
+      setStatus('Audio init failed: ' + err.message, true);
+      throw err;
+    }
+
+    // Route stepper value changes to the live audio graph. Called on any
+    // non-regen stepper edit (effect knobs) so tweaks are heard immediately
+    // without re-deriving ABC or restarting playback. Reverb decay rebuilds
+    // the impulse response asynchronously via a debounced generate().
+    let decayTimer = null;
+    function applyParam(name, val) {
+      if (!reverb) return;
+      switch (name) {
+        case 'reverb_wet':        reverb.wet.value = val; break;
+        case 'reverb_decay':
+          reverb.decay = val;
+          clearTimeout(decayTimer);
+          decayTimer = setTimeout(() => { try { reverb.generate(); } catch(_) {} }, 150);
+          break;
+        case 'vibrato_frequency': vibrato.frequency.value = val; break;
+        case 'vibrato_depth':     vibrato.depth.value = val; break;
+        case 'chorus_wet':        chorus.wet.value = val; break;
+        case 'chorus_depth':      chorus.depth = val; break;
+        case 'loop':              loopEnabled = val >= 0.5; break;
+        case 'loop_gap':          loopGapSecs = val; break;
+      }
+    }
+
+    Promise.all([Tone.loaded(), reverb.ready]).then(() => {
+      samplerReady = true;
+      setStatus(abcReady ? 'Ready — press Play' : 'Ready — press +/− then Play');
+      updateControls();
+    });
+
+    postToParent({ type: 'BD_READY' });
+
+    // ── ABC → notes (reused from bd_M_ABC) ──────────────────────────────────
+    const DIATONIC = ['C','D','E','F','G','A','B'];
+    const ACC_MAP  = { sharp: '#', flat: 'b', dblsharp: '##', dblflat: 'bb' };
+    function abcPitchToTone(abcPitch, accidental) {
+      const octave  = 4 + Math.floor(abcPitch / 7);
+      const noteIdx = ((abcPitch % 7) + 7) % 7;
+      const acc     = ACC_MAP[accidental] || '';
+      return `${DIATONIC[noteIdx]}${acc}${octave}`;
+    }
+    function parseBPM(abcText) {
+      const frac = abcText.match(/Q:\s*(\d+)\/(\d+)\s*=\s*(\d+)/);
+      if (frac) { const [, a, b, n] = frac.map(Number); return 4 * n * a / b; }
+      const simple = abcText.match(/Q:\s*(\d+)/);
+      if (simple) return parseInt(simple[1], 10);
+      return 120;
+    }
+    function extractNotes(parsed) {
+      const notes = [];
+      const tune = parsed && parsed[0];
+      if (!tune || !tune.lines) return notes;
+      let t = 0;
+      for (const line of tune.lines) {
+        if (!line.staff) continue;
+        for (const staff of line.staff) {
+          if (!staff.voices) continue;
+          for (const voice of staff.voices) {
+            for (const elem of voice) {
+              if (elem.el_type !== 'note') continue;
+              if (elem.rest) { t += elem.duration; continue; }
+              if (!elem.pitches || elem.pitches.length === 0) continue;
+              const elemTime = t;
+              elem.pitches.forEach(p => {
+                notes.push({
+                  time: elemTime,
+                  tonePitch: abcPitchToTone(p.pitch, p.accidental),
+                  durationWhole: elem.duration
+                });
+              });
+              t += elem.duration;
+            }
+          }
+        }
+      }
+      return notes;
+    }
+    function buildEvents(notes, bpm) {
+      const secondsPerWhole = 240 / bpm;
+      const events = [];
+      let endTime = 0;
+      for (const n of notes) {
+        const timeSecs = n.time * secondsPerWhole;
+        const durSecs  = n.durationWhole * secondsPerWhole;
+        events.push({ time: timeSecs, note: n.tonePitch, duration: durSecs });
+        if (timeSecs + durSecs > endTime) endTime = timeSecs + durSecs;
+      }
+      return { events, endTime };
+    }
+
+    function loadDerivedAbcIntoPlayer() {
+      if (typeof ABCJS === 'undefined') return;
+      let parsed;
+      try { parsed = ABCJS.parseOnly(derivedAbc); }
+      catch (err) {
+        setStatus('ABC parse failed', true);
+        return;
+      }
+      const notes = extractNotes(parsed);
+      if (notes.length === 0) {
+        setStatus('No playable notes in derived ABC', true);
+        abcReady = false; updateControls();
+        return;
+      }
+      const bpm = parseBPM(derivedAbc);
+      Tone.Transport.bpm.value = bpm;
+      const built = buildEvents(notes, bpm);
+      noteEvents = built.events;
+      endTimeSecs = built.endTime;
+      teardownPlayback();
+      playerState = 'stopped';
+      abcReady = true;
+      let readyMsg = `${notes.length} notes, ${endTimeSecs.toFixed(1)}s`;
+      if (lastGenerationInfo.iterReduced) {
+        readyMsg += ` [iter ${lastGenerationInfo.requestedIter} too big → using ${lastGenerationInfo.effectiveIter}]`;
+      }
+      if (lastGenerationInfo.skipSymbols > 0) {
+        readyMsg += ` (skipped ${lastGenerationInfo.skippedSegments} prefix segs)`;
+      }
+      if (generateAbcTruncated) readyMsg += ` [notes capped at ${MAX_NOTES}]`;
+      if (lastGenerationInfo.turtleTruncated) readyMsg += ` [turtle trimmed]`;
+      setStatus(samplerReady ? `Ready — ${readyMsg}` : 'Loading samples…');
+      updateControls();
+    }
+
+    // ── Playback ────────────────────────────────────────────────────────────
+    let loopTimer = null;
+    function teardownPlayback() {
+      clearTimeout(loopTimer);
+      loopTimer = null;
+      if (notePart) { notePart.stop(0); notePart.dispose(); notePart = null; }
+      Tone.Transport.stop();
+      Tone.Transport.cancel(0);
+    }
+    function startPlayback() {
+      teardownPlayback();
+      notePart = new Tone.Part((time, ev) => {
+        sampler.triggerAttackRelease(ev.note, ev.duration, time);
+      }, noteEvents);
+      notePart.start(0);
+      Tone.Transport.scheduleOnce(() => {
+        if (loopEnabled) {
+          setStatus('Looping…');
+          loopTimer = setTimeout(() => { startPlayback(); }, loopGapSecs * 1000);
+        } else {
+          playerState = 'finished';
+          setStatus('Finished');
+          updateControls();
+        }
+      }, endTimeSecs + 0.05);
+      Tone.Transport.start();
+      playerState = 'playing';
+      setStatus('Playing');
+      updateControls();
+    }
+    function updateControls() {
+      const ready = samplerReady && abcReady;
+      playPauseBtn.disabled = !ready;
+      stopBtn.disabled      = !ready;
+      playPauseBtn.textContent = (playerState === 'playing') ? 'Pause' : 'Play';
+      copyScriptBtn.disabled = !storedText;
+      copyAbcBtn.disabled     = !derivedAbc;
+      bakeMp3Btn.disabled     = !ready || baking;
+      downloadBtn.disabled    = !lastBakedBlob;
+      saveMidiBtn.disabled    = !derivedAbc;
+    }
+    playPauseBtn.addEventListener('click', async () => {
+      await Tone.start();
+      if (playerState === 'playing') {
+        Tone.Transport.pause(); playerState = 'paused'; setStatus('Paused');
+      } else if (playerState === 'paused') {
+        Tone.Transport.start(); playerState = 'playing'; setStatus('Playing');
+      } else {
+        startPlayback();
+      }
+      updateControls();
+    });
+    stopBtn.addEventListener('click', () => {
+      teardownPlayback();
+      playerState = 'stopped'; setStatus('Stopped'); updateControls();
+    });
+
+    // ── Stepper interaction ─────────────────────────────────────────────────
+    // Structural steppers (regen:true) → re-derive ABC (implicitly stops
+    // playback). Effect steppers → applyParam directly, tweak while playing.
+    // Log-scale steppers (logStep:true) advance by a fixed ratio rather than
+    // additive step.
+    function stepControl(name, dir) {
+      const s = STEPPERS.find(x => x.name === name);
+      if (!s) return;
+      const cur = getStepperValue(name);
+      let next;
+      if (s.logStep) {
+        const ratio = 1.15;
+        next = dir > 0 ? cur * ratio : cur / ratio;
+      } else {
+        next = cur + dir * s.step;
+      }
+      next = Math.max(s.min, Math.min(s.max, next));
+      next = parseFloat(next.toFixed(4));
+      if (formatDisplay(s, next) === formatDisplay(s, cur)) return;
+      setStepperValue(name, next);
+      if (s.regen) regenerateAbc();
+      else         applyParam(name, next);
+      announceState();
+    }
+
+    // ── Telling the host what this module is showing (2026-09-23) ──────────
+    //
+    // The convention V_Kolam already follows, brought here so that BD's `auto`
+    // works in both directions for Fractal. The push half already did — BD
+    // posts bd_script_update and the handler below calls
+    // syncSteppersFromScript — but the PULL half had nothing to listen to:
+    // this module announced BD_READY, BD_STATUS and a bd_script_response when
+    // asked, and never said anything of its own accord. So a stepper press
+    // moved the music and left the script untouched, with `auto` looking
+    // broken when it was merely deaf.
+    //
+    // Announced ONLY from a stepper press, never from regenerateAbc.
+    // regenerateAbc also runs when BD pushes a script in, and announcing there
+    // would echo BD's own text straight back at it — harmless in Kolam, where
+    // what comes back is byte-identical, and a loop here, where the script is
+    // REBUILT from the steppers and may differ cosmetically from what arrived.
+    // Announcing at the point a person actually changed something says the
+    // same thing with none of that risk.
+    //
+    // fromDrift is always false: nothing here animates on its own.
+    function announceState() {
+      try {
+        postToParent({
+          type: 'bd_av_state',
+          text: currentGrammarScript(),
+          fromDrift: false
+        });
+      } catch (_) {}
+    }
+    controlPanel.addEventListener('pointerdown', (event) => {
+      const btn = event.target.closest('.step-btn');
+      if (!btn || btn.disabled) return;
+      event.preventDefault();
+      try { btn.setPointerCapture(event.pointerId); } catch (_) {}
+      const name  = btn.dataset.name;
+      const delta = parseFloat(btn.dataset.delta);
+      stepControl(name, delta);
+      let repeatTimer = null;
+      const holdTimer = setTimeout(() => {
+        repeatTimer = setInterval(() => stepControl(name, delta), 120);
+      }, 500);
+      const stop = () => {
+        clearTimeout(holdTimer);
+        if (repeatTimer) clearInterval(repeatTimer);
+        btn.removeEventListener('pointerup',     stop);
+        btn.removeEventListener('pointercancel', stop);
+        btn.removeEventListener('pointerleave',  stop);
+      };
+      btn.addEventListener('pointerup',     stop);
+      btn.addEventListener('pointercancel', stop);
+      btn.addEventListener('pointerleave',  stop);
+    });
+
+    // ── LH buttons ──────────────────────────────────────────────────────────
+    function flashBtn(btn, label) {
+      const orig = btn.innerHTML;
+      btn.classList.add('flash');
+      btn.innerHTML = label;
+      setTimeout(() => { btn.classList.remove('flash'); btn.innerHTML = orig; }, 1200);
+    }
+    async function copyText(text) {
+      try { await navigator.clipboard.writeText(text); return true; }
+      catch (_) {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.setAttribute('readonly', '');
+        Object.assign(ta.style, { position:'fixed', left:'-9999px', opacity:'0' });
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        let ok = false;
+        try { ok = document.execCommand('copy'); } catch (_) {}
+        document.body.removeChild(ta);
+        return ok;
+      }
+    }
+
+    // Copy Script — the full script (grammar + current stepper values),
+    // baked in so downstream regenerates the same ABC).
+    copyScriptBtn.addEventListener('click', async () => {
+      const grammarText = currentGrammarScript();
+      if (await copyText(grammarText)) flashBtn(copyScriptBtn, 'Copied<br>✓');
+      else setStatus('Copy failed', true);
+    });
+
+    // Copy for ABC Player — wrap the derived ABC in a bd_M_ABC script shell
+    // with reasonable defaults for effects. Recipient pastes this into any
+    // bd_M_ABC node and it plays immediately (%%bd_module identifies the
+    // player; the rest are directives that player understands).
+    copyAbcBtn.addEventListener('click', async () => {
+      const abcOnly = extractAbcBody(derivedAbc);
+      // Ship the CURRENT effect stepper values into the wrapped script so
+      // the ABC player picks up right where the fractal player left off.
+      const wrapped =
+        '%%bd_module bd_M_ABC\n' +
+        `%%bd_reverb_wet ${getStepperValue('reverb_wet').toFixed(2)}\n` +
+        `%%bd_reverb_decay ${getStepperValue('reverb_decay').toFixed(2)}\n` +
+        `%%bd_vibrato_frequency ${getStepperValue('vibrato_frequency').toFixed(2)}\n` +
+        `%%bd_vibrato_depth ${getStepperValue('vibrato_depth').toFixed(2)}\n` +
+        `%%bd_chorus_wet ${getStepperValue('chorus_wet').toFixed(2)}\n` +
+        `%%bd_chorus_depth ${getStepperValue('chorus_depth').toFixed(2)}\n` +
+        `%%bd_loop ${getStepperValue('loop') >= 0.5 ? 'true' : 'false'}\n` +
+        `%%bd_loop_gap ${Math.round(getStepperValue('loop_gap'))}\n` +
+        '%%bd_score [\n' + abcOnly + '\n%%bd_]\n';
+      if (await copyText(wrapped)) flashBtn(copyAbcBtn, 'Copied<br>✓');
+      else setStatus('Copy failed', true);
+    });
+    function extractAbcBody(text) {
+      // derivedAbc already IS just ABC (no %%bd_ directives), return as-is.
+      return text.trim();
+    }
+
+    // Rebuild the grammar script from current storedText + stepper values.
+    // Preserves the user's rules but writes updated iterations/step/vertical/
+    // scale/root lines (or inserts them if absent).
+    function currentGrammarScript() {
+      let text = storedText || '';
+      // Preserve any rootOctave suffix (,,' or "'"×N) parsed from the current
+      // script — no stepper controls it yet, so we roundtrip via the script.
+      const parsedForOctave = parseGrammarFromScript(text);
+      // Root pitch class + octave suffix both come from the parsed script
+      // (stepper retired). Rebuild the token in ABC form.
+      const rootName    = NOTE_NAMES[parsedForOctave.root] || 'C';
+      const octSuffix   = parsedForOctave.rootOctave > 0
+        ? "'".repeat(parsedForOctave.rootOctave)
+        : parsedForOctave.rootOctave < 0
+          ? ",".repeat(-parsedForOctave.rootOctave)
+          : '';
+      const setters = {
+        iterations:        String(Math.round(getStepperValue('iterations'))),
+        step_seconds:      getStepperValue('step_seconds').toFixed(2),
+        vertical_time:     getStepperValue('vertical_time').toFixed(2),
+        scale:             SCALE_NAMES[getStepperValue('scale')] || 'minor',
+        root:              rootName + octSuffix,
+        reverb_wet:        getStepperValue('reverb_wet').toFixed(2),
+        reverb_decay:      getStepperValue('reverb_decay').toFixed(2),
+        vibrato_frequency: getStepperValue('vibrato_frequency').toFixed(2),
+        vibrato_depth:     getStepperValue('vibrato_depth').toFixed(2),
+        chorus_wet:        getStepperValue('chorus_wet').toFixed(2),
+        chorus_depth:      getStepperValue('chorus_depth').toFixed(2),
+        loop:              getStepperValue('loop') >= 0.5 ? 'true' : 'false',
+        loop_gap:          String(Math.round(getStepperValue('loop_gap')))
+      };
+      // Offsets (no stepper yet) — reuse the parse from the top.
+      setters.offset2 = String(parsedForOctave.offset2);
+      setters.offset3 = String(parsedForOctave.offset3);
+      for (const [key, val] of Object.entries(setters)) {
+        // RULE 1 of the collage plan: put back the form it was read in.
+        //
+        // This built `^%%bd_${key}` and wrote `%%bd_${key} ${val}`, so on a
+        // script carrying %%bd_p_iterations nothing matched, the else-branch
+        // fired, and a SECOND unmarked copy was appended. One stepper press
+        // would have left both lines, with the control reading whichever the
+        // parser reached first.
+        const reMarked = new RegExp(`^%%bd_p_${key}\\s+.*$`, 'm');
+        const rePlain  = new RegExp(`^%%bd_${key}\\s+.*$`, 'm');
+        const re   = reMarked.test(text) ? reMarked : rePlain;
+        const mark = reMarked.test(text) ? 'p_' : '';
+        const line = `%%bd_${mark}${key} ${val}`;
+        if (re.test(text)) text = text.replace(re, line);
+        else {
+          const lines = text.split('\n');
+          let lastBd = -1;
+          for (let i = 0; i < lines.length; i++) if (/^%%bd_/.test(lines[i])) lastBd = i;
+          lines.splice(lastBd + 1, 0, line);
+          text = lines.join('\n');
+        }
+      }
+      return text;
+    }
+
+    // ── Bake / Save wav / Save midi — reused pattern from bd_M_ABC ──────────
+    // First-tap info dialog explains what Bake / Save wav do and warns
+    // about the Safari-Private-Browsing anti-fingerprinting bug (Safari 17+
+    // injects random noise into all Web Audio output in Private mode, which
+    // makes the bake sound like noise). Session-scoped: once acknowledged
+    // with "Don't show again", subsequent clicks skip straight through.
+    // Dialog is rendered at BD's DOM level (not in this iframe): the
+    // iframe's position:fixed can't overlay the BD extend panel — they
+    // live in different DOMs — and the iframe's short viewport clips
+    // buttons off the bottom on iPhone. Module posts BD_INFO_DIALOG_REQUEST
+    // to the parent; BD (or standalone preview.html) shows the dialog and
+    // posts BD_INFO_DIALOG_RESULT back. If no parent responds within
+    // 300 ms, fall back to native confirm() so the user isn't stranded.
+    let bakeDialogAckd = false;
+    function showBakeInfoDialog(actionLabel, proceed) {
+      if (bakeDialogAckd) { proceed(); return; }
+      let done = false;
+      function handler(event) {
+        const d = event.data;
+        if (!d || d.type !== 'BD_INFO_DIALOG_RESULT') return;
+        if (done) return;
+        done = true;
+        window.removeEventListener('message', handler);
+        if (d.dontShowAgain) bakeDialogAckd = true;
+        if (d.action === 'continue') proceed();
+      }
+      window.addEventListener('message', handler);
+      postToParent({ type: 'BD_INFO_DIALOG_REQUEST', actionLabel });
+      setTimeout(() => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('message', handler);
+        const ok = window.confirm(
+          actionLabel + ' — ' +
+          'Renders/downloads a WAV; longer tunes take a few seconds. ' +
+          'KNOWN LIMITATION: Safari Private Browsing makes the output sound like noise ' +
+          '(Apple’s Safari 17+ anti-fingerprinting injects noise into Web Audio). ' +
+          'Use a regular Safari tab or Chrome/Firefox. Continue?'
+        );
+        if (ok) { bakeDialogAckd = true; proceed(); }
+      }, 300);
+    }
+
+    const BAKE_BTN_INITIAL = bakeMp3Btn.innerHTML;
+    async function doBake() {
+      if (baking || !abcReady) return;
+      baking = true; updateControls();
+      bakeMp3Btn.innerHTML = 'Baking…';
+      setStatus('Rendering to WAV…');
+      try {
+        const buffer = await renderOfflineToBuffer();
+        const wavBytes = audioBufferToWav(buffer);
+        const now = new Date();
+        const stamp = [now.getHours(), now.getMinutes(), now.getSeconds()]
+          .map(v => String(v).padStart(2, '0')).join(':');
+        const label = `fractal @ ${stamp}`;
+        lastBakedBlob  = new Blob([wavBytes], { type: 'audio/wav' });
+        lastBakedLabel = label;
+        postToParent({
+          type: 'BD_MEDIA_BLOB',
+          payload: { label, audioData: wavBytes.buffer, mime: 'audio/wav', sizeBytes: wavBytes.byteLength }
+        });
+        setStatus(`Baked ${label} (${(wavBytes.byteLength / (1024*1024)).toFixed(1)} MB) — see bottom bar`);
+      } catch (err) {
+        setStatus('Bake failed: ' + err.message, true);
+      } finally {
+        baking = false;
+        bakeMp3Btn.innerHTML = BAKE_BTN_INITIAL;
+        updateControls();
+      }
+    }
+    bakeMp3Btn.addEventListener('click', () => {
+      if (baking || !abcReady) return;
+      showBakeInfoDialog('Bake', doBake);
+    });
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    downloadBtn.addEventListener('click', () => {
+      if (!lastBakedBlob) return;
+      showBakeInfoDialog('Save wav', () => {
+        const safe = lastBakedLabel.replace(/[^A-Za-z0-9._-]+/g, '_') || 'bake';
+        downloadBlob(lastBakedBlob, `${safe}.wav`);
+      });
+    });
+    saveMidiBtn.addEventListener('click', () => {
+      if (!derivedAbc || typeof ABCJS === 'undefined' || !ABCJS.synth) return;
+      try {
+        const result = ABCJS.synth.getMidiFile(derivedAbc, { midiOutputType: 'binary' });
+        const bytes  = Array.isArray(result) ? result[0] : result;
+        if (!bytes || !bytes.byteLength) throw new Error('empty MIDI output');
+        const blob = new Blob([bytes], { type: 'audio/midi' });
+        downloadBlob(blob, 'fractal.mid');
+        setStatus(`Saved fractal.mid (${bytes.byteLength} bytes)`);
+      } catch (err) {
+        setStatus('Save midi failed: ' + err.message, true);
+      }
+    });
+
+    // iOS Safari workaround (2026-08-09): OfflineAudioContext.decodeAudioData
+    // on mp3 returns garbage on iOS, causing bakes to sound like noise while
+    // live playback (which uses the online AudioContext) works fine. Fix:
+    // decode the samples ONCE with the LIVE AudioContext (which iOS handles
+    // correctly), cache the AudioBuffers, and feed them directly to the
+    // offline Sampler — Tone.Sampler accepts pre-decoded AudioBuffers in the
+    // `urls` map, bypassing the offline decode entirely. Cross-context reuse
+    // works as long as sample rates match, which they do (Tone.Offline
+    // defaults to the live context's sample rate).
+    const SAMPLE_URLS = {
+      'F#2': 'bass_recorder_Fs2.mp3',
+      'C3':  'bass_recorder_C3.mp3',
+      'G#3': 'bass_recorder_Gs3.mp3',
+      'E4':  'bass_recorder_E4.mp3'
+    };
+    // 2026-08-09 iteration 3 — cache ArrayBuffers (fetch once) and decode
+    // fresh inside the offline context per render. Previous attempt used
+    // LIVE-context-decoded AudioBuffers passed cross-context to the offline
+    // Sampler — iOS Safari plays those as garbled data (audio envelope
+    // right, waveform content noise), plus Tone.Limiter also fails cross-
+    // context. Decoding inside the offline context keeps everything in one
+    // AudioContext family.
+    let cachedSampleArrayBuffers = null;
+    async function getSampleArrayBuffers() {
+      if (cachedSampleArrayBuffers) return cachedSampleArrayBuffers;
+      const entries = await Promise.all(
+        Object.entries(SAMPLE_URLS).map(async ([note, path]) => {
+          const res = await fetch('./bass-recorder/' + path);
+          if (!res.ok) throw new Error(`fetch ${path}: HTTP ${res.status}`);
+          const arr = await res.arrayBuffer();
+          return [note, arr];
+        })
+      );
+      cachedSampleArrayBuffers = Object.fromEntries(entries);
+      return cachedSampleArrayBuffers;
+    }
+
+    // Bake pipeline note (2026-08-09):
+    //  - Samples fetched once as ArrayBuffers, cached; decode happens
+    //    INSIDE the offline context per bake so the AudioBuffers are
+    //    native to that context (never cross AudioContext boundaries).
+    //  - Tone.Limiter tail keeps summed chord amplitudes under control.
+    //  - audioBufferToWav also normalises if peak > 1.0 (belt-and-braces).
+    //  - KNOWN CAVEAT: Safari's Private Browsing mode breaks
+    //    OfflineAudioContext + Tone effects (Reverb / Chorus produce
+    //    ~1000× over-amplitude — bake sounds like noise). No known code
+    //    workaround; users must bake in a REGULAR Safari tab. Chrome /
+    //    Firefox / other-browser private tabs are fine.
+    async function renderOfflineToBuffer() {
+      const rWet   = getStepperValue('reverb_wet');
+      const rDecay = getStepperValue('reverb_decay');
+      const vFreq  = getStepperValue('vibrato_frequency');
+      const vDepth = getStepperValue('vibrato_depth');
+      const cWet   = getStepperValue('chorus_wet');
+      const cDepth = getStepperValue('chorus_depth');
+      const durationSec = endTimeSecs + Math.max(rDecay, 0.5) + 0.5;
+
+      const sampleArrayBuffers = await getSampleArrayBuffers();
+      const liveRate = Tone.getContext().sampleRate;
+
+      const toneBuf = await Tone.Offline(async () => {
+        const offlineRaw = Tone.getContext().rawContext;
+        // Decode fresh inside the offline context (fresh ArrayBuffer copies
+        // because decodeAudioData consumes the buffer).
+        const decodedInline = {};
+        for (const [note, arr] of Object.entries(sampleArrayBuffers)) {
+          const copy = arr.slice(0);
+          decodedInline[note] = await offlineRaw.decodeAudioData(copy);
+        }
+        const lim = new Tone.Limiter(-1).toDestination();
+        const rev = new Tone.Reverb({ decay: Math.max(0.1, rDecay), wet: rWet }).connect(lim);
+        await rev.ready;
+        const vib = new Tone.Vibrato({ frequency: vFreq, depth: vDepth, type: 'sine' }).connect(rev);
+        const cho = new Tone.Chorus({ frequency: 1.5, delayTime: 3.5, depth: cDepth, wet: cWet }).connect(vib);
+        cho.start();
+        const smp = new Tone.Sampler({ urls: decodedInline }).connect(cho);
+        await Tone.loaded();
+        for (const ev of noteEvents) smp.triggerAttackRelease(ev.note, ev.duration, ev.time);
+      }, durationSec, 2, liveRate);
+      return toneBuf.get();
+    }
+    function audioBufferToWav(buffer) {
+      const numCh = buffer.numberOfChannels, sr = buffer.sampleRate, numSamp = buffer.length;
+      const bps = 2, ba = numCh * bps, br = sr * ba, ds = numSamp * ba, bs = 44 + ds;
+      const out = new Uint8Array(bs); const view = new DataView(out.buffer);
+      const w = (o, s) => { for (let i=0;i<s.length;i++) view.setUint8(o+i, s.charCodeAt(i)); };
+      w(0,'RIFF'); view.setUint32(4, bs-8, true); w(8,'WAVE'); w(12,'fmt ');
+      view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,numCh,true);
+      view.setUint32(24,sr,true); view.setUint32(28,br,true); view.setUint16(32,ba,true);
+      view.setUint16(34,16,true); w(36,'data'); view.setUint32(40,ds,true);
+      const ch = []; for (let c=0;c<numCh;c++) ch.push(buffer.getChannelData(c));
+      // 2026-08-09 — belt-and-braces normalisation. If peak absolute
+      // sample exceeds 1.0, scale everything down so peak lands at 0.98.
+      // Backstop for the in-chain limiter (upstream from us); without
+      // this, any over-range samples were being clipped to ±1 by the
+      // Int16 conversion, which on iOS turned an over-loud bake into
+      // pure noise.
+      let peak = 0;
+      for (let c = 0; c < numCh; c++) {
+        const data = ch[c];
+        for (let i = 0; i < numSamp; i++) {
+          const a = Math.abs(data[i]);
+          if (a > peak) peak = a;
+        }
+      }
+      const scale = peak > 1.0 ? (0.98 / peak) : 1.0;
+      let offset = 44;
+      for (let i=0;i<numSamp;i++) for (let c=0;c<numCh;c++) {
+        let s = Math.max(-1, Math.min(1, ch[c][i] * scale));
+        s = s < 0 ? s*0x8000 : s*0x7FFF;
+        view.setInt16(offset, s, true); offset += 2;
+      }
+      return out;
+    }
+
+    // ── postMessage entry ───────────────────────────────────────────────────
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (!data || typeof data !== 'object') return;
+      const type = data.type;
+      try {
+        if (type === 'BD_INIT') {
+          storedText = (data.payload && data.payload.text) || '';
+          syncSteppersFromScript();
+          regenerateAbc();
+        } else if (type === 'bd_script_update') {
+          storedText = typeof data.script === 'string' ? data.script : '';
+          syncSteppersFromScript();
+          regenerateAbc();
+          // DELIBERATELY SILENT. Announcing here was tried on 2026-09-23 and
+          // reverted within the hour: it loops.
+          //
+          // I reasoned the echo was bounded because the host declines a write
+          // when the card already equals the text. That holds only if what
+          // comes back is IDENTICAL to what went in, and here it is not — the
+          // script is rebuilt from the steppers, so BD writes it to the card,
+          // the card pushes it back, this rebuilds it again, and the two
+          // lengths alternate for ever. Observed at 421/430 chars, flooding
+          // the log and taking the graph down with it.
+          //
+          // Announcing on a STEPPER PRESS is what makes the pull direction
+          // work, and that cannot loop: a person has to press something.
+        } else if (type === 'bd_script_request') {
+          postToParent({ type: 'bd_script_response', script: currentGrammarScript() });
+        } else if (type === 'bd_ui_config') {
+          // The host is supplying the control surface, so this module is a
+          // viewer: hide the steppers and the copy buttons, keep Play/Stop.
+          // See the note beside .controls-hidden in the stylesheet.
+          document.body.classList.toggle('controls-hidden',
+                                         data && data.hideControls === true);
+          // hostChrome: does the host draw anything AROUND this iframe? BD
+          // does — it stamps its arrows and Extension panel into the two
+          // dock slots — so the layout reserves a grid area for each. A
+          // standalone draws neither. DEFAULTS TO TRUE, so a host that says
+          // nothing keeps BD's behaviour and nothing already working changes.
+          document.body.classList.toggle('no-host-chrome',
+                                         (data && data.hideControls === true) ||
+                                         (data && data.hostChrome === false));
+        } else if (type === 'BD_STOP') {
+          teardownPlayback();
+          playerState = 'stopped'; setStatus('Stopped'); updateControls();
+        }
+      } catch (err) {
+        console.error('music_module: postMessage error', err);
+        setStatus('Message error: ' + err.message, true);
+      }
+    });
+  </script>
+</body>
+</html>

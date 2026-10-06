@@ -287,18 +287,32 @@ instrument.
 
 The steppers move continuously; **the grammar does not move at all**. Editing a
 rule is a discrete jump, and `iterations` is worse — growth is exponential per
-pass (the default rules carry nine non-terminals, so each pass multiplies the
-string about ninefold), which is why `MAX_TOTAL_EMISSION` exists and why
-iteration 9+ of Peano would otherwise ask for ~4 billion symbols. Between
-iteration 5 and 6 there is nothing.
+pass, which is why `MAX_SYMBOLS_TRAVERSED` exists. Between iteration 5 and 6
+there is nothing.
+
+**And `iterations` is worse still than "discrete" — it is barely a control at
+all.** Measured 2026-10-06, counting *distinct figures* across the stepper's
+5–20 range: **4** under the Peano rules this module used to ship with, **3**
+under the current ones. Iterations 6 and 8 are byte-identical under both,
+because the curve is self-similar and the skip lands on a self-similar boundary
+*by construction*. The fractal is **one endless string**; depth only ever
+extends it, and the only audible axis is where you begin.
 
 **There is already a mechanism here that knows where it is in the string**, and
-it is the hook. The `skipSymbols` machinery walks the whole prefix to maintain
-turtle state but *keeps* only segments from `skipSymbols` onward, so iteration N
-plays the material iteration N-1 did not. That is a positional cursor into the
-rewritten string, which is exactly what a fractional iteration count needs.
+it is the hook. `sharedOpening()` measures how much iteration N repeats of N-1,
+and `expandAndWalk` traverses that prefix without storing it, keeping only what
+follows. That is a positional cursor into the rewritten string — and since
+2026-10-06 it is a cheap one, because the prefix costs time rather than memory.
 
-**Fractional iterations.** `%%bd_iterations 5.4` = iteration 5 with 40% of its
+**So build `start_at` FIRST**, before the fractional idea below. One directive
+giving the offset into the string directly, with `iterations` derived from it
+(expand to whatever depth covers `start_at` + the kept window). That replaces a
+depth control that cannot hear itself and a skip that aims at the one place the
+material repeats, with the single axis that actually changes what you hear.
+Everything below then has somewhere to stand.
+
+**Fractional iterations**, once `start_at` exists.
+`%%bd_iterations 5.4` = iteration 5 with 40% of its
 symbols rewritten one more pass. Deterministic, reproducible from the script,
 no new directive vocabulary, and it makes `iterations` a stepper you can hold
 down. Two selection orders are worth building and comparing, because they will

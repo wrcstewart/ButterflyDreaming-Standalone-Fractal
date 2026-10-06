@@ -304,12 +304,22 @@ and `expandAndWalk` traverses that prefix without storing it, keeping only what
 follows. That is a positional cursor into the rewritten string — and since
 2026-10-06 it is a cheap one, because the prefix costs time rather than memory.
 
-**So build `start_at` FIRST**, before the fractional idea below. One directive
-giving the offset into the string directly, with `iterations` derived from it
-(expand to whatever depth covers `start_at` + the kept window). That replaces a
-depth control that cannot hear itself and a skip that aims at the one place the
-material repeats, with the single axis that actually changes what you hear.
-Everything below then has somewhere to stand.
+**`start_at` is BUILT (2026-10-06)** and is the control to reach for. A
+`%%bd_p_start_at` stepper giving the offset into the rewritten string in
+**thousands of symbols** — `2.5` means 2,500 — added to the shared opening so
+`0` is the behaviour from before it existed, and clamped to 25% of the
+iteration's real length with the clamp reported rather than silent. Measured:
+**twelve settings from 0 to 177k give twelve distinct figures**, against three
+for `iterations` across its whole 5–20 range.
+
+**What is left of the idea**: `iterations` is now nearly redundant — it only
+decides how long the string is, which is to say how far `start_at` may reach.
+Deriving it (expand to whatever depth covers `start_at` + the kept window) and
+taking it off the panel is the tidy ending, and is NOT done, because removing a
+control from scripts people have already saved is not reversible. That is a
+decision for the author, not a refactor to slip in.
+
+Everything below now has somewhere to stand.
 
 **Fractional iterations**, once `start_at` exists.
 `%%bd_iterations 5.4` = iteration 5 with 40% of its

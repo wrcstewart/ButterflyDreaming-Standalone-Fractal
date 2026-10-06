@@ -16,8 +16,8 @@ pitch. Where the kolam makes a figure, this makes a melody from the same kind of
 string.
 
     %%bd_axiom X
-    %%bd_rule X: XFYFX+F+YFXFY-F-XFYFX
-    %%bd_rule Y: YFXFY-F-XFYFX+F+YFXFY
+    %%bd_rule X: FYFX+F+YFXFY-F-XFYFX
+    %%bd_rule Y: FXFY-F-XFYFX+F+YFXFY
     %%bd_iterations 5
     %%bd_angle 90
 
@@ -92,7 +92,7 @@ directive opens with `[` and closes on a line that is exactly `%%bd_]`.
 
     %%bd_module bd_M_Fractal
     %%bd_axiom X
-    %%bd_rule X: XFYFX+F+YFXFY-F-XFYFX
+    %%bd_rule X: FYFX+F+YFXFY-F-XFYFX
     %%bd_p_iterations 5
     %%bd_angle 90
     %%bd_p_scale min_pentatonic
